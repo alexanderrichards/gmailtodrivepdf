@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.python-version
+uv.lock
+
+# Virtual environments
+.venv
+
+# Google OAuth secrets and output
+credentials.json
+token.json
+client_secret*.json
+pdfs/
+
