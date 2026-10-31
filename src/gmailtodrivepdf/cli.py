@@ -149,11 +149,13 @@ def main(
                 if threads:
                     thread = gmail.get_thread(gmail_service, message_id)
                     path = output_dir / f"thread [{thread.id}].pdf"
-                    state = path.with_suffix(".thread-state")
                     revision = hashlib.sha256(
                         f"v1:{thread.revision}:{thread_order.value}:{keep_quotes}:{allow_remote_images}".encode()
                     ).hexdigest()
-                    unchanged = path.exists() and state.exists() and state.read_text(encoding="ascii") == revision
+                    unchanged = (
+                        not overwrite and path.exists()
+                        and pdf.read_thread_revision(path) == revision
+                    )
                     if unchanged and not overwrite:
                         skipped += 1
                     else:
@@ -162,13 +164,8 @@ def main(
                             newest_first=thread_order == ThreadOrder.newest_first,
                             keep_quotes=keep_quotes,
                             allow_remote_images=allow_remote_images,
+                            revision=revision,
                         )
-                        state_tmp = state.with_suffix(".thread-state.part")
-                        try:
-                            state_tmp.write_text(revision, encoding="ascii")
-                            state_tmp.replace(state)
-                        finally:
-                            state_tmp.unlink(missing_ok=True)
                         created += 1
                     if drive_service is not None and folder_id is not None:
                         _, did_upload = drive.upload_pdf(

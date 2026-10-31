@@ -121,10 +121,14 @@ header. Unrecognised history, generic blockquotes and interleaved plain-text rep
 are retained. Replies written inside explicitly marked HTML quote containers may
 be removed too; use `--keep-quotes` when retaining all content matters.
 
-Conversation PDFs have stable names: `thread [<thread id>].pdf`. A small adjacent
-`.thread-state` file tracks the exported revision and rendering options. Keep it
-alongside the PDF. New or changed messages, changed ordering/quote/image options,
-or missing state cause regeneration; unchanged conversations are skipped.
+Conversation PDFs have stable names: `thread [<thread id>].pdf`. Their custom
+`/GmailToDriveThreadRevision` metadata stores the revision hash and tracks the
+exported messages and rendering options without separate state files.
+New or changed messages, changed ordering/quote/image options, or missing revision
+metadata cause regeneration; unchanged conversations are skipped. PDF editors may
+remove this metadata, which causes regeneration on the next run.
+Unreadable PDFs are reported as errors; use
+`--overwrite` to replace them.
 Drive exports track their revision independently and replace outdated thread PDFs
 without needing `--overwrite`, including retrying previously failed uploads.
 `--overwrite` forces regeneration and replacement.

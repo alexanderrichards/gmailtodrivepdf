@@ -10,7 +10,8 @@ from types import TracebackType
 from urllib.parse import urlsplit
 
 from playwright.sync_api import Browser, Error as PlaywrightError, Playwright, Route, sync_playwright
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
+from pypdf.errors import PyPdfError
 
 from .gmail import EmailMessage
 from .gmail import EmailThread
@@ -20,6 +21,7 @@ _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 _CID_URL = re.compile(r"""cid:([^\s"'<>()]+)""", re.IGNORECASE)
 _MAX_STEM_LENGTH = 120
 _TIMEOUT_MS = 30_000
+THREAD_REVISION_KEY = "/GmailToDriveThreadRevision"
 _HEADER_CSS = """
 @page { size: A4; margin: 15mm; }
 .gtdp-header { border-bottom: 1px solid #888; margin-bottom: 12px; padding-bottom: 6px;
@@ -36,6 +38,16 @@ img { max-width: 100%; }
 
 class PdfRenderError(RuntimeError):
     pass
+
+
+def read_thread_revision(path: Path) -> str | None:
+    """Read export state without leaving a Windows file lock behind."""
+    try:
+        with path.open("rb") as handle:
+            metadata = PdfReader(handle).metadata
+            return metadata.get(THREAD_REVISION_KEY) if metadata else None
+    except (PyPdfError, OSError, ValueError) as exc:
+        raise PdfRenderError(f"Could not read thread PDF metadata from {path}: {exc}") from exc
 
 
 class _EmailHTMLParser(HTMLParser):
@@ -263,6 +275,7 @@ class PdfRenderer:
     def render_thread(
         self, thread: EmailThread, destination: Path, newest_first: bool = False,
         keep_quotes: bool = False, allow_remote_images: bool = False,
+        revision: str | None = None,
     ) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         tmp = destination.with_suffix(".pdf.part")
@@ -277,6 +290,8 @@ class PdfRenderer:
                             part, allow_remote_images,
                         )
                         writer.append(str(part), outline_item=f"{message.subject or '(no subject)'} - {message.sender}")
+                    if revision is not None:
+                        writer.add_metadata({THREAD_REVISION_KEY: revision})
                     writer.write(str(tmp))
             tmp.replace(destination)
         except Exception as exc:
