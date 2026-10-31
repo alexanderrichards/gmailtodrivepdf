@@ -5,12 +5,16 @@ import html
 import re
 from html.parser import HTMLParser
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import TracebackType
 from urllib.parse import urlsplit
 
 from playwright.sync_api import Browser, Error as PlaywrightError, Playwright, Route, sync_playwright
+from pypdf import PdfWriter
 
 from .gmail import EmailMessage
+from .gmail import EmailThread
+from .quotes import without_quotes
 
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 _CID_URL = re.compile(r"""cid:([^\s"'<>()]+)""", re.IGNORECASE)
@@ -254,6 +258,30 @@ class PdfRenderer:
             raise PdfRenderError(
                 f"Failed to render message {message.id} to PDF: {exc}"
             ) from exc
+        return destination
+
+    def render_thread(
+        self, thread: EmailThread, destination: Path, newest_first: bool = False,
+        keep_quotes: bool = False, allow_remote_images: bool = False,
+    ) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_suffix(".pdf.part")
+        messages = list(reversed(thread.messages)) if newest_first else thread.messages
+        try:
+            with TemporaryDirectory(prefix="gmailtodrivepdf-thread-") as directory:
+                with PdfWriter() as writer:
+                    for index, message in enumerate(messages):
+                        part = Path(directory) / f"{index}.pdf"
+                        self.render_pdf(
+                            message if keep_quotes else without_quotes(message),
+                            part, allow_remote_images,
+                        )
+                        writer.append(str(part), outline_item=f"{message.subject or '(no subject)'} - {message.sender}")
+                    writer.write(str(tmp))
+            tmp.replace(destination)
+        except Exception as exc:
+            tmp.unlink(missing_ok=True)
+            raise PdfRenderError(f"Failed to render thread {thread.id}: {exc}") from exc
         return destination
 
 

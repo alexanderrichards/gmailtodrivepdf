@@ -1,6 +1,8 @@
 """Fetching and parsing Gmail messages."""
 
 import base64
+import hashlib
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,6 +39,13 @@ class EmailMessage:
     # Content-ID (without angle brackets) -> (mime type, raw bytes)
     inline_images: dict[str, tuple[str, bytes]] = field(default_factory=dict)
     attachment_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EmailThread:
+    id: str
+    messages: list[EmailMessage]
+    revision: str
 
 
 def _decode(data: str) -> bytes:
@@ -164,7 +173,7 @@ def resolve_label_ids(service: Any, names: list[str]) -> list[str]:
     return list(dict.fromkeys(lookup[name.casefold()] for name in names))
 
 
-def _list_label(service: Any, label_id: str, limit: int | None) -> Iterator[str]:
+def _list_label(service: Any, label_id: str, limit: int | None, threads: bool = False) -> Iterator[str]:
     page_token: str | None = None
     yielded = 0
     while True:
@@ -181,7 +190,7 @@ def _list_label(service: Any, label_id: str, limit: int | None) -> Iterator[str]
             .execute(num_retries=GMAIL_REQUEST_RETRIES)
         )
         for item in response.get("messages", []):
-            yield item["id"]
+            yield item["threadId"] if threads else item["id"]
             yielded += 1
             if limit is not None and yielded >= limit:
                 return
@@ -191,17 +200,32 @@ def _list_label(service: Any, label_id: str, limit: int | None) -> Iterator[str]
 
 
 def list_message_ids(
-    service: Any, label_ids: list[str], max_results: int | None = None
+    service: Any, label_ids: list[str], max_results: int | None = None, threads: bool = False,
 ) -> list[str]:
     """Return IDs of messages carrying any of ``label_ids``, without duplicates."""
     # The API's labelIds filter requires *all* labels, so query each label separately.
     seen: dict[str, None] = {}
     for label_id in label_ids:
-        for message_id in _list_label(service, label_id, max_results):
+        for message_id in _list_label(service, label_id, None if threads else max_results, threads):
             seen.setdefault(message_id, None)
             if max_results is not None and len(seen) >= max_results:
                 return list(seen)
     return list(seen)
+
+
+def get_thread(service: Any, thread_id: str) -> EmailThread:
+    raw = (
+        service.users().threads().get(userId="me", id=thread_id, format="full")
+        .execute(num_retries=GMAIL_REQUEST_RETRIES)
+    )
+    messages = raw.get("messages", [])
+    if not messages:
+        raise ValueError(f"Gmail thread {thread_id} contains no messages")
+    messages = sorted(messages, key=lambda message: (int(message["internalDate"]), message["id"]))
+    revision = hashlib.sha256(
+        json.dumps(messages, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return EmailThread(thread_id, [parse_message(service, message) for message in messages], revision)
 
 
 def get_message(service: Any, message_id: str) -> EmailMessage:

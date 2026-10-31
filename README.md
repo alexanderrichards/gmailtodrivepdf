@@ -72,6 +72,12 @@ uv run gmailtodrivepdf --upload-to-drive
 # Convert emails labelled "Receipts" or "Work/Invoices" instead of starred ones
 uv run gmailtodrivepdf --labels "Receipts,Work/Invoices"
 
+# Export complete conversations oldest first, removing recognisable reply history
+uv run gmailtodrivepdf --threads
+
+# Export newest first instead, retaining quoted history
+uv run gmailtodrivepdf --threads --thread-order newest-first --keep-quotes
+
 # Upload to a differently named Drive folder, processing only the 10 most recent
 uv run gmailtodrivepdf -u --drive-folder "Starred emails" -n 10
 ```
@@ -82,7 +88,10 @@ uv run gmailtodrivepdf -u --drive-folder "Starred emails" -n 10
 | `-u`, `--upload-to-drive` | Also upload the PDFs to Google Drive. |
 | `--drive-folder` | Name of the Drive folder in *My Drive* (default: `pdfs`). It is created if it does not exist. |
 | `-l`, `--labels` | Comma-separated Gmail labels. Converts emails with **any** of these labels instead of starred emails. Names are case-insensitive; nested labels use `/` (e.g. `Work/Invoices`); system labels such as `INBOX` or `IMPORTANT` also work. Unknown labels are reported with a list of your available labels. |
-| `-n`, `--max-results` | Process at most this many emails. |
+| `-n`, `--max-results` | Process at most this many emails, or distinct conversations with `--threads`. |
+| `--threads` | Export all messages in each matching conversation into one PDF. |
+| `--thread-order` | `oldest-first` (default) or `newest-first`; used with `--threads`. |
+| `--keep-quotes` | Retain quoted reply history in thread PDFs instead of best-effort removal. Requires `--threads`. |
 | `--overwrite` | Regenerate PDFs that already exist locally and replace them in Drive. |
 | `--allow-remote-images` | Download remote HTTPS images referenced in emails. |
 | `--credentials` | Path to the OAuth client secrets JSON file. |
@@ -90,6 +99,35 @@ uv run gmailtodrivepdf -u --drive-folder "Starred emails" -n 10
 
 Files are named `YYYY-MM-DD <subject> [<message id>].pdf`, so reruns skip emails that
 have already been converted or uploaded.
+
+### Conversation exports
+
+Without `--threads`, message-by-message export is unchanged, including quoted
+history. In thread mode, a conversation is selected when at least one message
+matches your starred/label filters. All messages returned by Gmail for that thread
+are exported, including unstarred replies and your sent messages. Conversations
+are deduplicated across labels; `--max-results` limits conversations.
+
+Messages are ordered by Gmail's internal timestamp, oldest first by default.
+Each begins on a new page with its own subject, sender, recipients, date and
+attachment list. Each message is rendered in isolation before its pages are merged,
+preserving its HTML styling and inline images without leaking CSS between messages.
+PDF bookmarks identify the messages. Regular attachment contents are not exported.
+
+Quote removal is deliberately conservative: explicitly marked `gmail_quote`
+containers and `blockquote type="cite"` blocks are removed from HTML. Plain-text
+history is removed only for a trailing quoted run following an `On ... wrote:`
+header. Unrecognised history, generic blockquotes and interleaved plain-text replies
+are retained. Replies written inside explicitly marked HTML quote containers may
+be removed too; use `--keep-quotes` when retaining all content matters.
+
+Conversation PDFs have stable names: `thread [<thread id>].pdf`. A small adjacent
+`.thread-state` file tracks the exported revision and rendering options. Keep it
+alongside the PDF. New or changed messages, changed ordering/quote/image options,
+or missing state cause regeneration; unchanged conversations are skipped.
+Drive exports track their revision independently and replace outdated thread PDFs
+without needing `--overwrite`, including retrying previously failed uploads.
+`--overwrite` forces regeneration and replacement.
 
 ## Troubleshooting
 

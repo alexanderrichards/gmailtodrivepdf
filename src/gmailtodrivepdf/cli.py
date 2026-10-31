@@ -1,6 +1,8 @@
 """Command-line interface."""
 
 from pathlib import Path
+from enum import Enum
+import hashlib
 from typing import Annotated
 
 import typer
@@ -14,6 +16,11 @@ app = typer.Typer(
     "files, optionally uploading them to Google Drive.",
     no_args_is_help=False,
 )
+
+
+class ThreadOrder(str, Enum):
+    oldest_first = "oldest-first"
+    newest_first = "newest-first"
 
 
 @app.command()
@@ -43,7 +50,7 @@ def main(
     max_results: Annotated[
         int | None,
         typer.Option(
-            "--max-results", "-n", min=1, help="Maximum number of emails to process."
+            "--max-results", "-n", min=1, help="Maximum number of emails (or conversations with --threads) to process."
         ),
     ] = None,
     labels: Annotated[
@@ -56,6 +63,9 @@ def main(
             'case-insensitive; nested labels use "/", e.g. "Work/Receipts".',
         ),
     ] = None,
+    threads: Annotated[bool, typer.Option(help="Export one PDF per matching conversation, including all its messages.")] = False,
+    thread_order: Annotated[ThreadOrder, typer.Option(help="Message order within --threads PDFs.")] = ThreadOrder.oldest_first,
+    keep_quotes: Annotated[bool, typer.Option(help="Keep quoted reply history in --threads mode.")] = False,
     overwrite: Annotated[
         bool,
         typer.Option(help="Re-create PDFs that already exist locally or in Drive."),
@@ -80,6 +90,8 @@ def main(
     ] = auth.default_token_path(),
 ) -> None:
     """Save every starred email (or emails with the given labels) as a PDF."""
+    if not threads and (keep_quotes or thread_order != ThreadOrder.oldest_first):
+        raise typer.BadParameter("--thread-order and --keep-quotes require --threads")
     label_names: list[str] | None = None
     if labels is not None:
         label_names = gmail.parse_label_list(labels)
@@ -118,7 +130,7 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        message_ids = gmail.list_message_ids(gmail_service, label_ids, max_results)
+        message_ids = gmail.list_message_ids(gmail_service, label_ids, max_results, threads=threads)
     except HttpError as exc:
         typer.secho(f"Failed to list emails: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -127,11 +139,43 @@ def main(
         typer.echo(f"No {description} found.")
         return
 
+    if threads:
+        description = f"conversation(s) containing {description}"
     typer.echo(f"Found {len(message_ids)} {description}.")
     created = skipped = uploaded = failed = 0
     with pdf.PdfRenderer() as renderer, typer.progressbar(message_ids, label="Processing") as progress:
         for message_id in progress:
             try:
+                if threads:
+                    thread = gmail.get_thread(gmail_service, message_id)
+                    path = output_dir / f"thread [{thread.id}].pdf"
+                    state = path.with_suffix(".thread-state")
+                    revision = hashlib.sha256(
+                        f"v1:{thread.revision}:{thread_order.value}:{keep_quotes}:{allow_remote_images}".encode()
+                    ).hexdigest()
+                    unchanged = path.exists() and state.exists() and state.read_text(encoding="ascii") == revision
+                    if unchanged and not overwrite:
+                        skipped += 1
+                    else:
+                        renderer.render_thread(
+                            thread, path,
+                            newest_first=thread_order == ThreadOrder.newest_first,
+                            keep_quotes=keep_quotes,
+                            allow_remote_images=allow_remote_images,
+                        )
+                        state_tmp = state.with_suffix(".thread-state.part")
+                        try:
+                            state_tmp.write_text(revision, encoding="ascii")
+                            state_tmp.replace(state)
+                        finally:
+                            state_tmp.unlink(missing_ok=True)
+                        created += 1
+                    if drive_service is not None and folder_id is not None:
+                        _, did_upload = drive.upload_pdf(
+                            drive_service, path, folder_id, overwrite, revision=revision,
+                        )
+                        uploaded += did_upload
+                    continue
                 message = gmail.get_message(gmail_service, message_id)
                 path = output_dir / pdf.safe_filename(message)
                 if path.exists() and not overwrite:
@@ -144,7 +188,7 @@ def main(
                         drive_service, path, folder_id, overwrite
                     )
                     uploaded += did_upload
-            except (HttpError, pdf.PdfRenderError, OSError) as exc:
+            except (HttpError, pdf.PdfRenderError, OSError, ValueError) as exc:
                 failed += 1
                 typer.secho(f"\nError processing {message_id}: {exc}", fg=typer.colors.RED, err=True)
 

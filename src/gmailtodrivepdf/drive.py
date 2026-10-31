@@ -53,7 +53,8 @@ def find_file(service: Any, name: str, folder_id: str) -> str | None:
 
 
 def upload_pdf(
-    service: Any, path: Path, folder_id: str, overwrite: bool = False
+    service: Any, path: Path, folder_id: str, overwrite: bool = False,
+    revision: str | None = None,
 ) -> tuple[str, bool]:
     """Upload ``path`` to the folder.
 
@@ -62,21 +63,35 @@ def upload_pdf(
     """
     existing = find_file(service, path.name, folder_id)
     if existing and not overwrite:
-        return existing, False
+        if revision is None:
+            return existing, False
+        metadata = service.files().get(fileId=existing, fields="appProperties").execute()
+        if metadata.get("appProperties", {}).get("threadRevision") == revision:
+            return existing, False
 
     media = MediaFileUpload(str(path), mimetype="application/pdf", resumable=True)
-    if existing:
-        result = (
-            service.files().update(fileId=existing, media_body=media, fields="id").execute()
-        )
-    else:
-        result = (
-            service.files()
-            .create(
-                body={"name": path.name, "parents": [folder_id]},
-                media_body=media,
-                fields="id",
+    try:
+        if existing:
+            options: dict[str, Any] = {}
+            if revision is not None:
+                options["body"] = {"appProperties": {"threadRevision": revision}}
+            result = service.files().update(
+                fileId=existing, media_body=media, fields="id", **options,
+            ).execute()
+        else:
+            body: dict[str, Any] = {"name": path.name, "parents": [folder_id]}
+            if revision is not None:
+                body["appProperties"] = {"threadRevision": revision}
+            result = (
+                service.files()
+                .create(
+                    body=body,
+                    media_body=media,
+                    fields="id",
+                )
+                .execute()
             )
-            .execute()
-        )
+    finally:
+        # Release Windows file locks, including when an upload fails.
+        media.stream().close()
     return result["id"], True
