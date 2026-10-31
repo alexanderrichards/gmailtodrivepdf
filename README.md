@@ -121,14 +121,26 @@ header. Unrecognised history, generic blockquotes and interleaved plain-text rep
 are retained. Replies written inside explicitly marked HTML quote containers may
 be removed too; use `--keep-quotes` when retaining all content matters.
 
-Conversation PDFs have stable names: `thread [<thread id>].pdf`. Their custom
-`/GmailToDriveThreadRevision` metadata stores the revision hash and tracks the
-exported messages and rendering options without separate state files.
+Conversation PDFs are named after the oldest message's subject, for example
+`Invoice.pdf`. The title is sanitised for filesystem use and limited in length.
+When multiple exported conversations have the same filename (including case,
+sanitisation or truncation collisions), **all** receive an ID suffix:
+`Invoice [<thread id>].pdf`. An earlier subject-only export is renamed when a later
+collision is discovered. Unrelated local files are not overwritten.
+
+PDF metadata stores `/GmailToDriveThreadId`, `/GmailToDriveThreadSubject` and
+`/GmailToDriveThreadRevision`; the ID identifies the export independently of its
+filename, and the revision hash tracks its messages and rendering options without
+separate state files. If the oldest message's subject changes, the PDF is renamed.
+Drive files are likewise identified by thread ID and renamed without duplicating
+the export. Collisions also include previously exported conversations not selected
+in the current run and app-created thread exports already in the Drive folder.
 New or changed messages, changed ordering/quote/image options, or missing revision
 metadata cause regeneration; unchanged conversations are skipped. PDF editors may
 remove this metadata, which causes regeneration on the next run.
-Unreadable PDFs are reported as errors; use
-`--overwrite` to replace them.
+Unreadable PDFs in the output folder and duplicate thread IDs are reported as
+errors. Move or remove unreadable files before retrying. PDFs whose identifying
+metadata was removed are treated as unrelated files, not overwritten.
 Drive exports track their revision independently and replace outdated thread PDFs
 without needing `--overwrite`, including retrying previously failed uploads.
 `--overwrite` forces regeneration and replacement.

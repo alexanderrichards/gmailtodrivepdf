@@ -140,7 +140,7 @@ def test_cli_thread_reruns_options_and_new_replies(tmp_path: Path, monkeypatch):
     first = runner.invoke(cli.app, args)
     assert first.exit_code == 0, first.output
     assert "Created 1" in first.output
-    path = tmp_path / "thread [t].pdf"
+    path = tmp_path / "Conversation.pdf"
     assert path.exists()
     revision = pdf.read_thread_revision(path)
     assert revision is not None and len(revision) == 64
@@ -187,7 +187,10 @@ def test_cli_thread_retries_drive_upload_even_when_local_pdf_unchanged(tmp_path:
     service = thread_service()
     drive_service = MagicMock()
     files = drive_service.files()
-    files.list.return_value.execute.return_value = {"files": [{"id": "remote"}]}
+    files.list.return_value.execute.return_value = {"files": [{
+        "id": "remote", "name": "Conversation.pdf",
+        "description": "Conversation", "appProperties": {"threadId": "t"},
+    }]}
     files.get.return_value.execute.return_value = {"appProperties": {}}
     files.update.return_value.execute.side_effect = [OSError("Network interrupted"), {"id": "remote"}]
     monkeypatch.setattr(cli.auth, "get_credentials", lambda *args: object())
@@ -227,12 +230,12 @@ def test_missing_pdf_metadata_regenerates_and_overwrite_forces_update(tmp_path: 
     runner = CliRunner()
     args = ["--threads", "-o", str(tmp_path)]
     assert runner.invoke(cli.app, args).exit_code == 0
-    path = tmp_path / "thread [t].pdf"
+    path = tmp_path / "Conversation.pdf"
     with pdf.PdfWriter(clone_from=str(path)) as writer:
-        writer.metadata = None
+        writer.add_metadata({pdf.THREAD_REVISION_KEY: ""})
         writer.write(str(tmp_path / "without-metadata.pdf"))
     (tmp_path / "without-metadata.pdf").replace(path)
-    assert pdf.read_thread_revision(path) is None
+    assert pdf.read_thread_revision(path) == ""
     result = runner.invoke(cli.app, args)
     assert result.exit_code == 0 and "Created 1" in result.output
     result = runner.invoke(cli.app, args + ["--overwrite"])
@@ -243,7 +246,7 @@ def test_unreadable_thread_pdf_reports_error_and_overwrite_recovers(tmp_path: Pa
     service = thread_service()
     monkeypatch.setattr(cli.auth, "get_credentials", lambda *args: object())
     monkeypatch.setattr(cli, "build", lambda *args, **kwargs: service)
-    path = tmp_path / "thread [t].pdf"
+    path = tmp_path / "Conversation.pdf"
     path.write_bytes(b"not a PDF")
     args = ["--threads", "-o", str(tmp_path)]
     runner = CliRunner()
@@ -251,7 +254,8 @@ def test_unreadable_thread_pdf_reports_error_and_overwrite_recovers(tmp_path: Pa
     assert result.exit_code == 1
     assert "Could not read thread PDF metadata" in result.output
     assert path.read_bytes() == b"not a PDF"
-    result = runner.invoke(cli.app, args + ["--overwrite"])
+    path.unlink()
+    result = runner.invoke(cli.app, args)
     assert result.exit_code == 0, result.output
     assert pdf.read_thread_revision(path) is not None
 

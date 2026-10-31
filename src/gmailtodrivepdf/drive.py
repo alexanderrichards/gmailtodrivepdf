@@ -52,16 +52,61 @@ def find_file(service: Any, name: str, folder_id: str) -> str | None:
     return files[0]["id"] if files else None
 
 
+def list_thread_files(service: Any, folder_id: str) -> list[dict[str, Any]]:
+    query = f"'{_escape(folder_id)}' in parents and trashed = false"
+    files: list[dict[str, Any]] = []
+    token = None
+    while True:
+        response = service.files().list(
+            q=query, spaces="drive", fields="nextPageToken,files(id,name,description,appProperties)",
+            pageSize=1000, pageToken=token,
+        ).execute()
+        files.extend(
+            file for file in response.get("files", [])
+            if file.get("appProperties", {}).get("threadId")
+        )
+        token = response.get("nextPageToken")
+        if not token:
+            return files
+
+
+def rename_thread_files(service: Any, files: list[dict[str, Any]], names: dict[str, Path]) -> None:
+    for file in files:
+        id = file["appProperties"]["threadId"]
+        if id in names and file["name"] != names[id].name:
+            service.files().update(
+                fileId=file["id"], body={"name": names[id].name}, fields="id",
+            ).execute()
+            file["name"] = names[id].name
+
+
 def upload_pdf(
     service: Any, path: Path, folder_id: str, overwrite: bool = False,
     revision: str | None = None,
+    thread_id: str | None = None,
+    thread_subject: str | None = None,
 ) -> tuple[str, bool]:
     """Upload ``path`` to the folder.
 
     Returns ``(file_id, uploaded)``; ``uploaded`` is False when an existing file was
     left untouched.
     """
-    existing = find_file(service, path.name, folder_id)
+    existing = None
+    if thread_id is not None:
+        matches = [
+            file for file in list_thread_files(service, folder_id)
+            if file["appProperties"]["threadId"] == thread_id
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"Multiple Drive PDFs claim Gmail thread {thread_id}")
+        if matches:
+            existing = matches[0]["id"]
+            if matches[0]["name"] != path.name:
+                service.files().update(
+                    fileId=existing, body={"name": path.name}, fields="id",
+                ).execute()
+    else:
+        existing = find_file(service, path.name, folder_id)
     if existing and not overwrite:
         if revision is None:
             return existing, False
@@ -70,18 +115,27 @@ def upload_pdf(
             return existing, False
 
     media = MediaFileUpload(str(path), mimetype="application/pdf", resumable=True)
+    properties = {}
+    if revision is not None:
+        properties["threadRevision"] = revision
+    if thread_id is not None:
+        properties["threadId"] = thread_id
     try:
         if existing:
             options: dict[str, Any] = {}
-            if revision is not None:
-                options["body"] = {"appProperties": {"threadRevision": revision}}
+            if properties:
+                options["body"] = {"name": path.name, "appProperties": properties}
+                if thread_id is not None:
+                    options["body"]["description"] = thread_subject or ""
             result = service.files().update(
                 fileId=existing, media_body=media, fields="id", **options,
             ).execute()
         else:
             body: dict[str, Any] = {"name": path.name, "parents": [folder_id]}
-            if revision is not None:
-                body["appProperties"] = {"threadRevision": revision}
+            if properties:
+                body["appProperties"] = properties
+            if thread_id is not None:
+                body["description"] = thread_subject or ""
             result = (
                 service.files()
                 .create(

@@ -22,6 +22,8 @@ _CID_URL = re.compile(r"""cid:([^\s"'<>()]+)""", re.IGNORECASE)
 _MAX_STEM_LENGTH = 120
 _TIMEOUT_MS = 30_000
 THREAD_REVISION_KEY = "/GmailToDriveThreadRevision"
+THREAD_ID_KEY = "/GmailToDriveThreadId"
+THREAD_SUBJECT_KEY = "/GmailToDriveThreadSubject"
 _HEADER_CSS = """
 @page { size: A4; margin: 15mm; }
 .gtdp-header { border-bottom: 1px solid #888; margin-bottom: 12px; padding-bottom: 6px;
@@ -42,10 +44,17 @@ class PdfRenderError(RuntimeError):
 
 def read_thread_revision(path: Path) -> str | None:
     """Read export state without leaving a Windows file lock behind."""
+    return read_thread_metadata(path).get(THREAD_REVISION_KEY)
+
+
+def read_thread_metadata(path: Path) -> dict[str, str]:
     try:
         with path.open("rb") as handle:
             metadata = PdfReader(handle).metadata
-            return metadata.get(THREAD_REVISION_KEY) if metadata else None
+            return {
+                key: value for key in (THREAD_ID_KEY, THREAD_SUBJECT_KEY, THREAD_REVISION_KEY)
+                if metadata and isinstance(value := metadata.get(key), str)
+            }
     except (PyPdfError, OSError, ValueError) as exc:
         raise PdfRenderError(f"Could not read thread PDF metadata from {path}: {exc}") from exc
 
@@ -283,6 +292,11 @@ class PdfRenderer:
         try:
             with TemporaryDirectory(prefix="gmailtodrivepdf-thread-") as directory:
                 with PdfWriter() as writer:
+                    writer.add_metadata({
+                        THREAD_ID_KEY: thread.id,
+                        THREAD_SUBJECT_KEY: thread.messages[0].subject,
+                        "/Title": thread.messages[0].subject or "(no subject)",
+                    })
                     for index, message in enumerate(messages):
                         part = Path(directory) / f"{index}.pdf"
                         self.render_pdf(

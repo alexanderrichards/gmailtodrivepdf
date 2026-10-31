@@ -10,6 +10,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from . import auth, drive, gmail, pdf
+from .thread_files import ThreadFiles
 
 app = typer.Typer(
     help="Convert starred Gmail messages (or messages with chosen labels) to PDF "
@@ -141,6 +142,25 @@ def main(
 
     if threads:
         description = f"conversation(s) containing {description}"
+    thread_files = None
+    remote_threads = []
+    if threads:
+        try:
+            if drive_service is not None and folder_id is not None:
+                remote_threads = drive.list_thread_files(drive_service, folder_id)
+            remote_subjects = {}
+            for file in remote_threads:
+                properties = file["appProperties"]
+                id = properties["threadId"]
+                if id in remote_subjects:
+                    raise ValueError(f"Multiple Drive PDFs claim Gmail thread {id}")
+                if "description" not in file:
+                    raise ValueError(f"Drive thread {id} is missing subject metadata")
+                remote_subjects[id] = file["description"]
+            thread_files = ThreadFiles(output_dir, remote_subjects)
+        except (pdf.PdfRenderError, HttpError, OSError, ValueError) as exc:
+            typer.secho(f"Could not identify existing thread exports: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
     typer.echo(f"Found {len(message_ids)} {description}.")
     created = skipped = uploaded = failed = 0
     with pdf.PdfRenderer() as renderer, typer.progressbar(message_ids, label="Processing") as progress:
@@ -148,7 +168,11 @@ def main(
             try:
                 if threads:
                     thread = gmail.get_thread(gmail_service, message_id)
-                    path = output_dir / f"thread [{thread.id}].pdf"
+                    assert thread_files is not None
+                    names = thread_files.assign(thread.id, thread.messages[0].subject)
+                    path = names[thread.id]
+                    if drive_service is not None:
+                        drive.rename_thread_files(drive_service, remote_threads, names)
                     revision = hashlib.sha256(
                         f"v1:{thread.revision}:{thread_order.value}:{keep_quotes}:{allow_remote_images}".encode()
                     ).hexdigest()
@@ -167,10 +191,22 @@ def main(
                             revision=revision,
                         )
                         created += 1
+                    thread_files.saved(thread.id, path)
                     if drive_service is not None and folder_id is not None:
-                        _, did_upload = drive.upload_pdf(
+                        drive_id, did_upload = drive.upload_pdf(
                             drive_service, path, folder_id, overwrite, revision=revision,
+                            thread_id=thread.id, thread_subject=thread.messages[0].subject,
                         )
+                        for file in remote_threads:
+                            if file["appProperties"]["threadId"] == thread.id:
+                                file["description"] = thread.messages[0].subject
+                                break
+                        else:
+                            remote_threads.append({
+                                "id": drive_id, "name": path.name,
+                                "description": thread.messages[0].subject,
+                                "appProperties": {"threadId": thread.id},
+                            })
                         uploaded += did_upload
                     continue
                 message = gmail.get_message(gmail_service, message_id)
