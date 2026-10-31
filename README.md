@@ -11,11 +11,19 @@ It uses these public Google APIs:
   to create the folder and upload files. This scope only lets the app see files
   it created itself.
 
-The PDFs are rendered locally with [xhtml2pdf](https://github.com/xhtml2pdf/xhtml2pdf).
+The PDFs are rendered locally with headless Chromium through
+[Playwright](https://playwright.dev/python/).
 Each PDF has a header with the subject, sender, recipients, date and attachment names,
 followed by the email body (HTML if available, otherwise plain text). Inline (`cid:`)
 images are embedded. By default, remote images are blocked because they are often
-tracking pixels. Local file references are always blocked.
+tracking pixels. JavaScript, local file references, frames, external stylesheets
+and external fonts are blocked. `--allow-remote-images` permits HTTPS image requests
+only; enabling it may let senders track that an email was processed.
+
+Chromium preserves HTML styling and prints paginated A4 PDFs with backgrounds.
+One browser is reused throughout a run, with an isolated context for each email.
+Rendering failures are reported and do not replace existing PDFs with partial files.
+There is no automatic text-only fallback. Plain-text-only emails are still supported.
 
 ## Google Cloud setup (one-off)
 
@@ -41,7 +49,13 @@ Requires Python 3.14+ and [uv](https://docs.astral.sh/uv/).
 
 ```shell
 uv sync
+uv run playwright install chromium
 ```
+
+The second command downloads Playwright's browser (several hundred megabytes);
+Google Chrome does not need to be installed. Repeat it after updating Playwright.
+On Linux, `uv run playwright install --with-deps chromium` also installs the
+required system libraries and may need administrator privileges.
 
 ## Usage
 
@@ -76,6 +90,28 @@ uv run gmailtodrivepdf -u --drive-folder "Starred emails" -n 10
 
 Files are named `YYYY-MM-DD <subject> [<message id>].pdf`, so reruns skip emails that
 have already been converted or uploaded.
+
+## Troubleshooting
+
+- **`Could not start Chromium`:** run `uv run playwright install chromium`.
+  If the browser is already installed, check the accompanying browser error for
+  missing system libraries or sandbox restrictions.
+- **Earlier `LayoutError` / `BlockBox` / `PmlKeepInFrame` errors:** these came from
+  xhtml2pdf, which has now been replaced. Retry those emails with Chromium. Use
+  `--overwrite` to regenerate previously saved text-only recovery PDFs.
+  Browser printing is more compatible with email HTML, but unusually large or
+  fixed-size content can still need adjustments.
+- **Gmail `403 rateLimitExceeded` or `userRateLimitExceeded`:** Gmail limits API
+  usage over time, and reading messages and downloading inline images each consume
+  quota. All Gmail read requests now use Google's built-in exponential backoff
+  with jitter, with up to seven retries. You may see retry warnings and a pause
+  while the quota recovers. `429` and transient server errors are also retried.
+  If retries are exhausted, the error is still reported; avoid simultaneous runs
+  against the same account and try again later. Permission errors and daily quota
+  errors are not retried, since waiting briefly does not resolve them.
+
+After updating, rerun the same command to retry failed emails. Successfully saved
+PDFs are skipped unless you use `--overwrite`.
 
 ## Development
 

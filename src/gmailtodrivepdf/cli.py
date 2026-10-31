@@ -129,7 +129,7 @@ def main(
 
     typer.echo(f"Found {len(message_ids)} {description}.")
     created = skipped = uploaded = failed = 0
-    with typer.progressbar(message_ids, label="Processing") as progress:
+    with pdf.PdfRenderer() as renderer, typer.progressbar(message_ids, label="Processing") as progress:
         for message_id in progress:
             try:
                 message = gmail.get_message(gmail_service, message_id)
@@ -137,7 +137,7 @@ def main(
                 if path.exists() and not overwrite:
                     skipped += 1
                 else:
-                    pdf.render_pdf(message, path, allow_remote_images)
+                    renderer.render_pdf(message, path, allow_remote_images)
                     created += 1
                 if drive_service is not None and folder_id is not None:
                     _, did_upload = drive.upload_pdf(

@@ -8,6 +8,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 STARRED_LABEL_ID = "STARRED"
+GMAIL_REQUEST_RETRIES = 7
 # Messages with these labels are excluded from listings unless explicitly requested.
 _SPAM_TRASH_LABEL_IDS = {"SPAM", "TRASH"}
 
@@ -68,7 +69,7 @@ def _part_bytes(service: Any, message_id: str, body: dict[str, Any]) -> bytes:
             .messages()
             .attachments()
             .get(userId="me", messageId=message_id, id=body["attachmentId"])
-            .execute()
+            .execute(num_retries=GMAIL_REQUEST_RETRIES)
         )
         return _decode(attachment["data"])
     return b""
@@ -143,7 +144,13 @@ def resolve_label_ids(service: Any, names: list[str]) -> list[str]:
     System labels such as INBOX or STARRED have names equal to their IDs, so they
     can be given either way.
     """
-    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    labels = (
+        service.users()
+        .labels()
+        .list(userId="me")
+        .execute(num_retries=GMAIL_REQUEST_RETRIES)
+        .get("labels", [])
+    )
     lookup: dict[str, str] = {}
     for label in labels:
         lookup.setdefault(label["name"].casefold(), label["id"])
@@ -171,7 +178,7 @@ def _list_label(service: Any, label_id: str, limit: int | None) -> Iterator[str]
                 pageToken=page_token,
                 maxResults=500,
             )
-            .execute()
+            .execute(num_retries=GMAIL_REQUEST_RETRIES)
         )
         for item in response.get("messages", []):
             yield item["id"]
@@ -202,6 +209,6 @@ def get_message(service: Any, message_id: str) -> EmailMessage:
         service.users()
         .messages()
         .get(userId="me", id=message_id, format="full")
-        .execute()
+        .execute(num_retries=GMAIL_REQUEST_RETRIES)
     )
     return parse_message(service, raw)

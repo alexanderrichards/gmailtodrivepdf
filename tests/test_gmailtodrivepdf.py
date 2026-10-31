@@ -1,9 +1,15 @@
 import base64
+import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httplib2
 import pytest
+from googleapiclient.errors import HttpError
+from googleapiclient.http import HttpRequest
+from playwright.sync_api import Error as PlaywrightError
+from pypdf import PdfReader
 from typer.testing import CliRunner
 
 from gmailtodrivepdf import cli, drive, gmail, pdf
@@ -17,6 +23,16 @@ def b64(data: bytes | str) -> str:
     if isinstance(data, str):
         data = data.encode()
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def pdf_image_sizes(path: Path) -> list[tuple[int, int]]:
+    # Chromium also embeds its broken-image icon for resources blocked by CSP.
+    objects = PdfReader(path).pages[0]["/Resources"].get("/XObject", {})
+    return [
+        (obj["/Width"], obj["/Height"])
+        for reference in objects.values()
+        if (obj := reference.get_object()).get("/Subtype") == "/Image"
+    ]
 
 
 def raw_message(message_id: str = "abc123") -> dict:
@@ -110,6 +126,9 @@ def gmail_service(messages: dict[str, dict], labelled: dict[str, list[str]] | No
 
 def test_parse_message_extracts_parts():
     service = gmail_service({"abc123": raw_message()})
+    get = service.users().messages().get
+    get.side_effect = None
+    get.return_value.execute.return_value = raw_message()
     message = gmail.get_message(service, "abc123")
 
     assert message.subject == "Invoice: Q3/2026 <final>"
@@ -119,6 +138,12 @@ def test_parse_message_extracts_parts():
     assert "<b>world</b> \u00e9" in message.html_body
     assert message.inline_images["logo@x"] == ("image/png", PNG)
     assert message.attachment_names == ["invoice.pdf"]
+    get.return_value.execute.assert_called_once_with(
+        num_retries=gmail.GMAIL_REQUEST_RETRIES
+    )
+    service.users().messages().attachments().get.return_value.execute.assert_called_once_with(
+        num_retries=gmail.GMAIL_REQUEST_RETRIES
+    )
 
 
 def test_list_message_ids_paginates_and_limits():
@@ -133,6 +158,7 @@ def test_list_message_ids_paginates_and_limits():
     assert first["labelIds"] == ["STARRED"]
     assert first["includeSpamTrash"] is False
     assert list_call.call_args_list[1].kwargs["pageToken"] == "t"
+    list_call.return_value.execute.assert_called_with(num_retries=gmail.GMAIL_REQUEST_RETRIES)
 
     list_call.return_value.execute.side_effect = [
         {"messages": [{"id": "1"}, {"id": "2"}], "nextPageToken": "t"},
@@ -168,6 +194,76 @@ def test_resolve_label_ids():
         gmail.resolve_label_ids(service, ["Receipts", "Nope"])
     assert info.value.unknown == ["Nope"]
     assert "Work/Projects" in info.value.available
+    service.users().labels().list().execute.assert_called_with(
+        num_retries=gmail.GMAIL_REQUEST_RETRIES
+    )
+
+
+def api_request(responses: list[tuple[int, dict]]) -> HttpRequest:
+    http = MagicMock()
+    http.request.side_effect = [
+        (httplib2.Response({"status": str(status)}), json.dumps(body).encode())
+        for status, body in responses
+    ]
+    request = HttpRequest(
+        http,
+        lambda response, content: json.loads(content),
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/example",
+    )
+    request._sleep = MagicMock()
+    request._rand = lambda: 0.5
+    return request
+
+
+def api_error(status: int, reason: str) -> tuple[int, dict]:
+    return status, {"error": {"code": status, "errors": [{"reason": reason}]}}
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(403, "rateLimitExceeded"), (403, "userRateLimitExceeded"), (429, "tooManyRequests"), (503, "backendError")],
+)
+def test_gmail_attachment_download_retries_transient_errors(status: int, reason: str):
+    request = api_request([
+        api_error(status, reason),
+        (200, {"data": b64(PNG)}),
+    ])
+    service = MagicMock()
+    service.users().messages().attachments().get.return_value = request
+
+    assert gmail._part_bytes(service, "example", {"attachmentId": "image"}) == PNG
+    assert request.http.request.call_count == 2
+    request._sleep.assert_called_once_with(1.0)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(403, "insufficientPermissions"), (403, "dailyLimitExceeded"), (401, "authError"), (404, "notFound")],
+)
+def test_gmail_does_not_retry_permanent_errors(status: int, reason: str):
+    request = api_request([api_error(status, reason)])
+    service = MagicMock()
+    service.users().messages().get.return_value = request
+
+    with pytest.raises(HttpError):
+        gmail.get_message(service, "example")
+    assert request.http.request.call_count == 1
+    request._sleep.assert_not_called()
+
+
+def test_gmail_retries_are_bounded_and_use_exponential_backoff():
+    request = api_request(
+        [api_error(403, "rateLimitExceeded")] * (gmail.GMAIL_REQUEST_RETRIES + 1)
+    )
+    service = MagicMock()
+    service.users().messages().attachments().get.return_value = request
+
+    with pytest.raises(HttpError):
+        gmail._part_bytes(service, "example", {"attachmentId": "image"})
+    assert request.http.request.call_count == gmail.GMAIL_REQUEST_RETRIES + 1
+    assert [call.args[0] for call in request._sleep.call_args_list] == [
+        1, 2, 4, 8, 16, 32, 64,
+    ]
 
 
 def test_safe_filename():
@@ -185,16 +281,50 @@ def test_build_html_strips_scripts_and_escapes_headers():
     assert "Invoice: Q3/2026 &lt;final&gt;" in html
 
 
-def test_link_callback_blocks_local_and_remote_files():
+def test_build_html_embeds_inline_images_and_blocks_active_content():
     message = gmail.EmailMessage(id="x", inline_images={"logo@x": ("image/png", PNG)})
-    callback = pdf._make_link_callback(message, allow_remote=False)
-    assert callback("cid:logo@x", "").startswith("data:image/png;base64,")
-    assert callback("file:///etc/passwd", "") == pdf._BLANK_IMAGE
-    assert callback("C:\\secret.png", "") == pdf._BLANK_IMAGE
-    assert callback("https://tracker.example/p.gif", "") == pdf._BLANK_IMAGE
-    allow = pdf._make_link_callback(message, allow_remote=True)
-    assert allow("https://example.com/a.png", "") == "https://example.com/a.png"
-    assert allow("http://example.com/a.png", "") == pdf._BLANK_IMAGE
+    message.html_body = (
+        '<html><head><meta http-equiv="refresh" content="0;url=https://example.com">'
+        '<base href="file:///"><link rel="stylesheet" href="https://example.com/style.css">'
+        '<style>.logo {background-image:url(cid:logo@x)}</style></head>'
+        '<body><script>alert(1)</script><iframe srcdoc="secret"></iframe>'
+        '<object data="file:///secret"></object><img src="cid:logo@x" onerror="alert(1)">'
+        '<a href="file:///secret">Unsafe link</a><p>Receipt &amp; tax</p></body></html>'
+    )
+    document = pdf.build_html(message)
+    assert f"data:image/png;base64,{base64.b64encode(PNG).decode()}" in document
+    for forbidden in ("<script", "<iframe", "<object", "<base", "<link", 'http-equiv="refresh"', "onerror", "file:///"):
+        assert forbidden not in document
+    assert "Receipt &amp; tax" in document
+    assert "img-src data:;" in document
+    assert "img-src data: https:;" in pdf.build_html(message, True)
+
+
+@pytest.mark.parametrize("allow_remote", [False, True])
+@pytest.mark.parametrize(
+    ("url", "resource_type", "navigation", "allowed"),
+    [
+        ("https://example.com/image.png", "image", False, True),
+        ("http://example.com/image.png", "image", False, False),
+        ("file:///secret.png", "image", False, False),
+        ("https://example.com/style.css", "stylesheet", False, False),
+        ("https://example.com/code.js", "script", False, False),
+        ("https://example.com/font.woff", "font", False, False),
+        ("https://example.com/page", "image", True, False),
+    ],
+)
+def test_browser_resource_routing(url, resource_type, navigation, allowed, allow_remote):
+    route = MagicMock()
+    route.request.url = url
+    route.request.resource_type = resource_type
+    route.request.is_navigation_request.return_value = navigation
+    pdf._route_resource(route, allow_remote)
+    if allowed and allow_remote:
+        route.continue_.assert_called_once()
+        route.abort.assert_not_called()
+    else:
+        route.abort.assert_called_once()
+        route.continue_.assert_not_called()
 
 
 @pytest.mark.parametrize("html_body", [True, False])
@@ -204,6 +334,14 @@ def test_render_pdf(tmp_path: Path, html_body: bool):
         message.html_body = None
     out = pdf.render_pdf(message, tmp_path / "sub" / "out.pdf")
     assert out.read_bytes().startswith(b"%PDF")
+    reader = PdfReader(out)
+    text = reader.pages[0].extract_text()
+    assert "Invoice: Q3/2026 <final>" in text
+    assert "Alice <alice@example.com>" in text
+    assert "invoice.pdf" in text
+    assert ("Hello world" if html_body else "Hello plain") in text
+    assert bool(reader.pages[0].images) == html_body
+    assert abs(float(reader.pages[0].mediabox.width) - 595.28) < 1
     assert not list(tmp_path.rglob("*.part"))
 
 
@@ -217,14 +355,172 @@ def test_render_pdf_with_lang_and_xml_lang(tmp_path: Path):
     assert out.read_bytes().startswith(b"%PDF")
 
 
-def test_render_pdf_wraps_parser_exceptions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    def boom(*args, **kwargs):
-        raise KeyError("lang")
+@pytest.mark.parametrize("nested", [False, True])
+def test_chromium_preserves_styled_html_across_pages(tmp_path: Path, nested: bool):
+    lines = [f"Receipt item {i:04d}" for i in range(250)]
+    inner = "".join(f"<tr><td>{line}</td></tr>" for line in lines)
+    source = (
+        '<html lang="en" xml:lang="en"><head><style>'
+        ".receipt {border: 2px solid #cc0000; background: #eeeeff; padding: 10px}"
+        "</style></head><body><script>not email text</script>"
+        '<div class="receipt">'
+        + ('<div class="receipt">' if nested else "")
+        + f"<table>{inner}</table>"
+        + ('</div>' if nested else "")
+        + "</div></body></html>"
+    )
+    message = gmail.EmailMessage(
+        id="layout",
+        subject="Test receipt",
+        html_body=source,
+        text_body="This plain-text alternative must not replace the HTML.",
+    )
+    destination = tmp_path / "receipt.pdf"
+    pdf.render_pdf(message, destination)
 
-    monkeypatch.setattr(pdf.pisa, "CreatePDF", boom)
-    with pytest.raises(pdf.PdfRenderError, match="KeyError"):
-        pdf.render_pdf(gmail.EmailMessage(id="x", text_body="hi"), tmp_path / "out.pdf")
+    reader = PdfReader(destination)
+    text = "\n".join(page.extract_text() for page in reader.pages)
+    assert len(reader.pages) > 1
+    assert "Test receipt" in text
+    assert all(line in text for line in lines)
+    assert "not email text" not in text
+    assert "plain-text alternative" not in text
+    graphics = reader.pages[0].get_contents().get_data()
+    assert b".8 0 0 RG" in graphics
+    assert b".9333 .9333 1 rg" in graphics
+    assert message.html_body == source
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_browser_failure_preserves_existing_pdf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    browser = MagicMock()
+    context = browser.new_context.return_value
+    page = context.new_page.return_value
+    def fail_print(**kwargs):
+        Path(kwargs["path"]).write_bytes(b"partial PDF")
+        raise PlaywrightError("Print failed")
+
+    page.pdf.side_effect = fail_print
+    monkeypatch.setattr(pdf.PdfRenderer, "_get_browser", lambda self: browser)
+    destination = tmp_path / "receipt.pdf"
+    destination.write_bytes(b"existing PDF")
+    message = gmail.EmailMessage(id="layout", html_body="<p>Receipt</p>")
+    with pytest.raises(pdf.PdfRenderError, match="Print failed"):
+        pdf.render_pdf(message, destination)
+    assert destination.read_bytes() == b"existing PDF"
+    context.close.assert_called_once()
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_missing_chromium_has_install_instructions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    manager = MagicMock()
+    playwright = manager.start.return_value
+    playwright.chromium.launch.side_effect = PlaywrightError("Executable doesn't exist")
+    monkeypatch.setattr(pdf, "sync_playwright", lambda: manager)
+    with pytest.raises(pdf.PdfRenderError, match="uv run playwright install chromium"):
+        pdf.render_pdf(gmail.EmailMessage(id="plain", text_body="Receipt"), tmp_path / "receipt.pdf")
+    playwright.stop.assert_called_once()
     assert not list(tmp_path.iterdir())
+
+
+def test_real_browser_blocks_active_local_and_remote_content_and_isolates_emails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    secret = tmp_path / "secret.svg"
+    secret.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">'
+        '<text x="10" y="30">LOCAL SECRET</text></svg>',
+        encoding="utf-8",
+    )
+    message = gmail.EmailMessage(
+        id="untrusted",
+        inline_images={"inline": ("image/png", PNG)},
+        html_body=(
+            '<meta http-equiv="refresh" content="0;url=https://example.invalid/redirect">'
+            '<script>document.body.innerHTML="SCRIPT EXECUTED"</script>'
+            '<img src="cid:inline" onload="document.body.innerHTML=\'HANDLER EXECUTED\'">'
+            f'<img src="{secret.as_uri()}">'
+            '<img src="https://example.invalid/tracker.png">'
+            '<iframe src="https://example.invalid/frame"></iframe>'
+            '<link rel="stylesheet" href="https://example.invalid/style.css">'
+            '<style>@import url("https://example.invalid/import.css");'
+            f'.local {{background-image: url("{secret.as_uri()}");}}'
+            '</style><div class="local">Safe receipt</div>'
+        ),
+    )
+    contexts = []
+    requests = []
+    failures = []
+    responses = []
+    with pdf.PdfRenderer() as renderer:
+        browser = renderer._get_browser()
+        real_new_context = browser.new_context
+
+        def record_context(**kwargs):
+            assert kwargs["java_script_enabled"] is False
+            assert kwargs["service_workers"] == "block"
+            context = real_new_context(**kwargs)
+            context.on("request", lambda request: requests.append(request.url))
+            context.on("requestfailed", lambda request: failures.append(request.url))
+            context.on("response", lambda response: responses.append(response.url))
+            contexts.append(context)
+            return context
+
+        monkeypatch.setattr(browser, "new_context", record_context)
+        first = renderer.render_pdf(message, tmp_path / "untrusted.pdf")
+        second = renderer.render_pdf(
+            gmail.EmailMessage(id="second", text_body="Independent email"),
+            tmp_path / "second.pdf",
+        )
+        assert renderer._get_browser() is browser
+        assert len(contexts) == 2
+        assert contexts[0] is not contexts[1]
+        assert not browser.contexts
+
+    assert renderer._browser is None
+    assert renderer._playwright is None
+    text = PdfReader(first).pages[0].extract_text()
+    assert "Safe receipt" in text
+    assert "EXECUTED" not in text
+    assert "LOCAL SECRET" not in text
+    assert pdf_image_sizes(first).count((1, 1)) == 1
+    assert (200, 100) not in pdf_image_sizes(first)
+    assert "Safe receipt" not in PdfReader(second).pages[0].extract_text()
+    blocked = {url for url in requests if url.startswith(("https:", "http:", "file:"))}
+    assert blocked <= set(failures)
+    assert not [url for url in responses if url.startswith(("https:", "http:", "file:"))]
+
+
+@pytest.mark.parametrize("allow_remote_images", [False, True])
+def test_real_browser_only_requests_https_images_when_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allow_remote_images: bool,
+):
+    requested = []
+
+    def intercept(route, allow_remote):
+        requested.append((route.request.url, route.request.resource_type))
+        if allow_remote and route.request.url == "https://example.invalid/allowed.png":
+            route.fulfill(content_type="image/png", body=PNG)
+        else:
+            route.abort()
+
+    monkeypatch.setattr(pdf, "_route_resource", intercept)
+    message = gmail.EmailMessage(
+        id="remote",
+        html_body=(
+            '<p>Remote image test</p><img src="https://example.invalid/allowed.png">'
+            '<img src="http://example.invalid/blocked.png">'
+            '<style>@import url("https://example.invalid/stylesheet.css");'
+            '@font-face {font-family: remote; src: url("https://example.invalid/font.woff")}'
+            'p {font-family: remote}</style>'
+            '<script src="https://example.invalid/code.js"></script>'
+        ),
+    )
+    path = pdf.render_pdf(message, tmp_path / "remote.pdf", allow_remote_images)
+    assert requested == (
+        [("https://example.invalid/allowed.png", "image")] if allow_remote_images else []
+    )
+    assert ((1, 1) in pdf_image_sizes(path)) == allow_remote_images
 
 
 def test_cli_continues_after_render_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -234,14 +530,14 @@ def test_cli_continues_after_render_failure(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(
         cli, "build", lambda *a, **k: gmail_service({"bad": bad, "good": raw_message("good")})
     )
-    real_create = pdf.pisa.CreatePDF
+    real_render = pdf.PdfRenderer.render_pdf
 
-    def flaky(src, *args, **kwargs):
-        if "<h1>Bad</h1>" in src:
-            raise KeyError("lang")
-        return real_create(src, *args, **kwargs)
+    def flaky(self, message, *args, **kwargs):
+        if message.subject == "Bad":
+            raise pdf.PdfRenderError("Print failed")
+        return real_render(self, message, *args, **kwargs)
 
-    monkeypatch.setattr(pdf.pisa, "CreatePDF", flaky)
+    monkeypatch.setattr(pdf.PdfRenderer, "render_pdf", flaky)
     out = tmp_path / "out"
     result = CliRunner().invoke(cli.app, ["-o", str(out)])
     assert result.exit_code == 1
@@ -306,6 +602,30 @@ def test_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     result = CliRunner().invoke(cli.app, ["-o", str(out)])
     assert result.exit_code == 0, result.output
     assert "skipped 2" in result.output
+
+
+def test_cli_uploads_chromium_pdf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = gmail_service({"receipt": raw_message("receipt")})
+    drive_service = MagicMock()
+    drive_service.files().list.return_value.execute.return_value = {"files": []}
+    drive_service.files().create.return_value.execute.return_value = {"id": "uploaded"}
+    monkeypatch.setattr(cli.auth, "get_credentials", lambda *a: object())
+    monkeypatch.setattr(
+        cli, "build", lambda name, *a, **k: service if name == "gmail" else drive_service,
+    )
+    result = CliRunner().invoke(cli.app, ["-o", str(tmp_path), "--upload-to-drive"])
+
+    assert result.exit_code == 0, result.output
+    assert "Created 1" in result.output
+    assert "uploaded 1" in result.output
+    path, = tmp_path.glob("*.pdf")
+    assert "Hello world" in PdfReader(path).pages[0].extract_text()
+    upload = drive_service.files().create.call_args.kwargs
+    assert upload["media_body"].mimetype() == "application/pdf"
+    assert upload["body"]["name"] == path.name
 
 
 def test_cli_default_output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
