@@ -1,4 +1,4 @@
-"""Fetching and parsing starred Gmail messages."""
+"""Fetching and parsing Gmail messages."""
 
 import base64
 from collections.abc import Iterator
@@ -7,7 +7,19 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-STARRED_QUERY = "is:starred"
+STARRED_LABEL_ID = "STARRED"
+# Messages with these labels are excluded from listings unless explicitly requested.
+_SPAM_TRASH_LABEL_IDS = {"SPAM", "TRASH"}
+
+
+class UnknownLabelError(ValueError):
+    def __init__(self, unknown: list[str], available: list[str]) -> None:
+        self.unknown = unknown
+        self.available = available
+        super().__init__(
+            f"Unknown Gmail label(s): {', '.join(unknown)}. "
+            f"Available labels: {', '.join(available)}"
+        )
 
 
 @dataclass
@@ -115,8 +127,37 @@ def parse_message(service: Any, raw: dict[str, Any]) -> EmailMessage:
     return message
 
 
-def list_starred_ids(service: Any, max_results: int | None = None) -> Iterator[str]:
-    """Yield the IDs of all starred messages, following pagination."""
+def parse_label_list(value: str) -> list[str]:
+    """Split a comma-separated list of label names, dropping blanks and duplicates."""
+    names: list[str] = []
+    for raw in value.split(","):
+        name = raw.strip()
+        if name and name.casefold() not in (n.casefold() for n in names):
+            names.append(name)
+    return names
+
+
+def resolve_label_ids(service: Any, names: list[str]) -> list[str]:
+    """Map label names (or IDs) to Gmail label IDs, matching case-insensitively.
+
+    System labels such as INBOX or STARRED have names equal to their IDs, so they
+    can be given either way.
+    """
+    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    lookup: dict[str, str] = {}
+    for label in labels:
+        lookup.setdefault(label["name"].casefold(), label["id"])
+        lookup.setdefault(label["id"].casefold(), label["id"])
+
+    unknown = [name for name in names if name.casefold() not in lookup]
+    if unknown:
+        raise UnknownLabelError(
+            unknown, sorted((label["name"] for label in labels), key=str.casefold)
+        )
+    return list(dict.fromkeys(lookup[name.casefold()] for name in names))
+
+
+def _list_label(service: Any, label_id: str, limit: int | None) -> Iterator[str]:
     page_token: str | None = None
     yielded = 0
     while True:
@@ -125,7 +166,8 @@ def list_starred_ids(service: Any, max_results: int | None = None) -> Iterator[s
             .messages()
             .list(
                 userId="me",
-                q=STARRED_QUERY,
+                labelIds=[label_id],
+                includeSpamTrash=label_id in _SPAM_TRASH_LABEL_IDS,
                 pageToken=page_token,
                 maxResults=500,
             )
@@ -134,11 +176,25 @@ def list_starred_ids(service: Any, max_results: int | None = None) -> Iterator[s
         for item in response.get("messages", []):
             yield item["id"]
             yielded += 1
-            if max_results is not None and yielded >= max_results:
+            if limit is not None and yielded >= limit:
                 return
         page_token = response.get("nextPageToken")
         if not page_token:
             return
+
+
+def list_message_ids(
+    service: Any, label_ids: list[str], max_results: int | None = None
+) -> list[str]:
+    """Return IDs of messages carrying any of ``label_ids``, without duplicates."""
+    # The API's labelIds filter requires *all* labels, so query each label separately.
+    seen: dict[str, None] = {}
+    for label_id in label_ids:
+        for message_id in _list_label(service, label_id, max_results):
+            seen.setdefault(message_id, None)
+            if max_results is not None and len(seen) >= max_results:
+                return list(seen)
+    return list(seen)
 
 
 def get_message(service: Any, message_id: str) -> EmailMessage:

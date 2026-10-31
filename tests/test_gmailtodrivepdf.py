@@ -78,12 +78,27 @@ def raw_message(message_id: str = "abc123") -> dict:
     }
 
 
-def gmail_service(messages: dict[str, dict]) -> MagicMock:
+LABELS = [
+    {"id": "INBOX", "name": "INBOX"},
+    {"id": "STARRED", "name": "STARRED"},
+    {"id": "Label_1", "name": "Receipts"},
+    {"id": "Label_2", "name": "Work/Projects"},
+]
+
+
+def gmail_service(messages: dict[str, dict], labelled: dict[str, list[str]] | None = None) -> MagicMock:
+    """Mock Gmail service. ``labelled`` maps label ID -> message IDs (default: all STARRED)."""
+    labelled = labelled if labelled is not None else {"STARRED": list(messages)}
     service = MagicMock()
-    msgs = service.users.return_value.messages.return_value
-    msgs.list.return_value.execute.return_value = {
-        "messages": [{"id": i} for i in messages]
+    service.users.return_value.labels.return_value.list.return_value.execute.return_value = {
+        "labels": LABELS
     }
+    msgs = service.users.return_value.messages.return_value
+    msgs.list.side_effect = lambda userId, labelIds, **kw: MagicMock(
+        execute=MagicMock(
+            return_value={"messages": [{"id": i} for i in labelled.get(labelIds[0], [])]}
+        )
+    )
     msgs.get.side_effect = lambda userId, id, format: MagicMock(
         execute=MagicMock(return_value=messages[id])
     )
@@ -106,20 +121,53 @@ def test_parse_message_extracts_parts():
     assert message.attachment_names == ["invoice.pdf"]
 
 
-def test_list_starred_ids_paginates_and_limits():
+def test_list_message_ids_paginates_and_limits():
     service = MagicMock()
     list_call = service.users.return_value.messages.return_value.list
     list_call.return_value.execute.side_effect = [
         {"messages": [{"id": "1"}, {"id": "2"}], "nextPageToken": "t"},
         {"messages": [{"id": "3"}]},
     ]
-    assert list(gmail.list_starred_ids(service)) == ["1", "2", "3"]
-    assert list_call.call_args_list[0].kwargs["q"] == "is:starred"
+    assert gmail.list_message_ids(service, ["STARRED"]) == ["1", "2", "3"]
+    first = list_call.call_args_list[0].kwargs
+    assert first["labelIds"] == ["STARRED"]
+    assert first["includeSpamTrash"] is False
+    assert list_call.call_args_list[1].kwargs["pageToken"] == "t"
 
     list_call.return_value.execute.side_effect = [
         {"messages": [{"id": "1"}, {"id": "2"}], "nextPageToken": "t"},
     ]
-    assert list(gmail.list_starred_ids(service, max_results=1)) == ["1"]
+    assert gmail.list_message_ids(service, ["STARRED"], max_results=1) == ["1"]
+
+
+def test_list_message_ids_unions_labels_without_duplicates():
+    service = gmail_service({}, {"Label_1": ["a", "b"], "Label_2": ["b", "c"], "TRASH": ["d"]})
+    assert gmail.list_message_ids(service, ["Label_1", "Label_2"]) == ["a", "b", "c"]
+    assert gmail.list_message_ids(service, ["Label_1", "Label_2"], max_results=2) == ["a", "b"]
+    gmail.list_message_ids(service, ["TRASH"])
+    list_call = service.users.return_value.messages.return_value.list
+    assert list_call.call_args.kwargs["includeSpamTrash"] is True
+
+
+def test_parse_label_list():
+    assert gmail.parse_label_list(" Receipts, work/projects ,,receipts, ") == [
+        "Receipts",
+        "work/projects",
+    ]
+    assert gmail.parse_label_list(" , ") == []
+
+
+def test_resolve_label_ids():
+    service = gmail_service({})
+    assert gmail.resolve_label_ids(service, ["receipts", "WORK/PROJECTS", "inbox", "Label_1"]) == [
+        "Label_1",
+        "Label_2",
+        "INBOX",
+    ]
+    with pytest.raises(gmail.UnknownLabelError) as info:
+        gmail.resolve_label_ids(service, ["Receipts", "Nope"])
+    assert info.value.unknown == ["Nope"]
+    assert "Work/Projects" in info.value.available
 
 
 def test_safe_filename():
@@ -267,6 +315,35 @@ def test_cli_default_output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     result = CliRunner().invoke(cli.app, [])
     assert result.exit_code == 0, result.output
     assert len(list((tmp_path / "pdfs").glob("*.pdf"))) == 1
+
+
+def test_cli_labels_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    messages = {i: raw_message(i) for i in ("s1", "r1", "w1", "o1")}
+    labelled = {"STARRED": ["s1"], "Label_1": ["r1"], "Label_2": ["w1", "r1"], "INBOX": ["o1"]}
+    monkeypatch.setattr(cli.auth, "get_credentials", lambda *a: object())
+    monkeypatch.setattr(cli, "build", lambda *a, **k: gmail_service(messages, labelled))
+
+    out = tmp_path / "out"
+    result = CliRunner().invoke(cli.app, ["-o", str(out), "--labels", "receipts, Work/Projects"])
+    assert result.exit_code == 0, result.output
+    assert "Found 2 email(s) labelled receipts, Work/Projects" in result.output
+    assert sorted(p.name.split("[")[1] for p in out.glob("*.pdf")) == ["r1].pdf", "w1].pdf"]
+
+
+def test_cli_unknown_label(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cli.auth, "get_credentials", lambda *a: object())
+    monkeypatch.setattr(cli, "build", lambda *a, **k: gmail_service({}))
+    out = tmp_path / "out"
+    result = CliRunner().invoke(cli.app, ["-o", str(out), "-l", "Receipts,Missing"])
+    assert result.exit_code == 2
+    assert "Unknown Gmail label(s): Missing" in result.output
+    assert not out.exists()
+
+
+def test_cli_empty_labels():
+    result = CliRunner().invoke(cli.app, ["--labels", " , "])
+    assert result.exit_code == 2
+    assert "at least one label" in result.output
 
 
 def test_cli_missing_credentials(tmp_path: Path):

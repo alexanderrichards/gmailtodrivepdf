@@ -10,8 +10,8 @@ from googleapiclient.errors import HttpError
 from . import auth, drive, gmail, pdf
 
 app = typer.Typer(
-    help="Convert starred Gmail messages to PDF files, optionally uploading them "
-    "to Google Drive.",
+    help="Convert starred Gmail messages (or messages with chosen labels) to PDF "
+    "files, optionally uploading them to Google Drive.",
     no_args_is_help=False,
 )
 
@@ -43,7 +43,17 @@ def main(
     max_results: Annotated[
         int | None,
         typer.Option(
-            "--max-results", "-n", min=1, help="Maximum number of starred emails to process."
+            "--max-results", "-n", min=1, help="Maximum number of emails to process."
+        ),
+    ] = None,
+    labels: Annotated[
+        str | None,
+        typer.Option(
+            "--labels",
+            "-l",
+            help="Comma-separated list of Gmail labels. Instead of starred emails, "
+            "convert emails that have any of these labels. Names are "
+            'case-insensitive; nested labels use "/", e.g. "Work/Receipts".',
         ),
     ] = None,
     overwrite: Annotated[
@@ -69,7 +79,13 @@ def main(
         typer.Option(help="Path at which to cache the OAuth token.", dir_okay=False),
     ] = auth.default_token_path(),
 ) -> None:
-    """Save every starred email in your Gmail account as a PDF."""
+    """Save every starred email (or emails with the given labels) as a PDF."""
+    label_names: list[str] | None = None
+    if labels is not None:
+        label_names = gmail.parse_label_list(labels)
+        if not label_names:
+            raise typer.BadParameter("must contain at least one label name", param_hint="'--labels'")
+
     scopes = auth.GMAIL_SCOPES + (auth.DRIVE_SCOPES if upload_to_drive else [])
     try:
         creds = auth.get_credentials(scopes, credentials, token)
@@ -78,6 +94,21 @@ def main(
         raise typer.Exit(code=2) from exc
 
     gmail_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    if label_names is None:
+        label_ids = [gmail.STARRED_LABEL_ID]
+        description = "starred email(s)"
+    else:
+        try:
+            label_ids = gmail.resolve_label_ids(gmail_service, label_names)
+        except gmail.UnknownLabelError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        except HttpError as exc:
+            typer.secho(f"Failed to list Gmail labels: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        description = f"email(s) labelled {', '.join(label_names)}"
+
     drive_service = None
     folder_id = None
     if upload_to_drive:
@@ -87,16 +118,16 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        message_ids = list(gmail.list_starred_ids(gmail_service, max_results))
+        message_ids = gmail.list_message_ids(gmail_service, label_ids, max_results)
     except HttpError as exc:
-        typer.secho(f"Failed to list starred emails: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(f"Failed to list emails: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
     if not message_ids:
-        typer.echo("No starred emails found.")
+        typer.echo(f"No {description} found.")
         return
 
-    typer.echo(f"Found {len(message_ids)} starred email(s).")
+    typer.echo(f"Found {len(message_ids)} {description}.")
     created = skipped = uploaded = failed = 0
     with typer.progressbar(message_ids, label="Processing") as progress:
         for message_id in progress:

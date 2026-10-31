@@ -1,11 +1,12 @@
 # gmailtodrivepdf
 
-A command-line tool that converts every **starred** email in your Gmail account into a
-PDF file. It can also upload the PDFs to a `pdfs` folder in Google Drive.
+A command-line tool that converts every **starred** email in your Gmail account (or,
+optionally, every email with chosen labels) into a PDF file. It can also upload the
+PDFs to a `pdfs` folder in Google Drive.
 
 It uses these public Google APIs:
 
-- **Gmail API** (`gmail.readonly` scope) to find (`is:starred`) and read messages.
+- **Gmail API** (`gmail.readonly` scope) to find starred (or labelled) messages and read them.
 - **Google Drive API** (`drive.file` scope, only requested with `--upload-to-drive`)
   to create the folder and upload files. This scope only lets the app see files
   it created itself.
@@ -54,6 +55,9 @@ uv run gmailtodrivepdf --output-dir ~/Documents/starred
 # Also upload to a "pdfs" folder in Google Drive
 uv run gmailtodrivepdf --upload-to-drive
 
+# Convert emails labelled "Receipts" or "Work/Invoices" instead of starred ones
+uv run gmailtodrivepdf --labels "Receipts,Work/Invoices"
+
 # Upload to a differently named Drive folder, processing only the 10 most recent
 uv run gmailtodrivepdf -u --drive-folder "Starred emails" -n 10
 ```
@@ -63,7 +67,8 @@ uv run gmailtodrivepdf -u --drive-folder "Starred emails" -n 10
 | `-o`, `--output-dir` | Directory for the PDFs (default: `./pdfs`). |
 | `-u`, `--upload-to-drive` | Also upload the PDFs to Google Drive. |
 | `--drive-folder` | Name of the Drive folder in *My Drive* (default: `pdfs`). It is created if it does not exist. |
-| `-n`, `--max-results` | Process at most this many starred emails. |
+| `-l`, `--labels` | Comma-separated Gmail labels. Converts emails with **any** of these labels instead of starred emails. Names are case-insensitive; nested labels use `/` (e.g. `Work/Invoices`); system labels such as `INBOX` or `IMPORTANT` also work. Unknown labels are reported with a list of your available labels. |
+| `-n`, `--max-results` | Process at most this many emails. |
 | `--overwrite` | Regenerate PDFs that already exist locally and replace them in Drive. |
 | `--allow-remote-images` | Download remote HTTPS images referenced in emails. |
 | `--credentials` | Path to the OAuth client secrets JSON file. |
